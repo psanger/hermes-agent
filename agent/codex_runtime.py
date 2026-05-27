@@ -287,6 +287,59 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 exc,
             )
             return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
+        except TypeError as exc:
+            err_text = str(exc)
+            # The OpenAI SDK's parse_response() raises
+            # ``TypeError: 'NoneType' object is not iterable`` when the
+            # ``response.completed`` SSE event carries ``output=null``
+            # instead of an empty list ``[]``.  This is a server-side
+            # format change observed on chatgpt.com/backend-api/codex
+            # (May 2026): the backend now sends null output in the
+            # terminal event rather than an empty list when the model
+            # output is only available via preceding output_item.done
+            # events.  The SDK calls parse_response() during stream
+            # iteration (inside accumulate_event), so the error surfaces
+            # as a TypeError inside ``for event in stream:``, AFTER the
+            # real content has already been delivered via
+            # response.output_item.done events that we collect in
+            # ``collected_output_items`` and response.output_text.delta
+            # events in ``agent._codex_streamed_text_parts``.
+            # Recovery: build a synthetic final response from that
+            # already-accumulated data so the agent loop can proceed.
+            if "NoneType" in err_text and "not iterable" in err_text:
+                streamed_chars = sum(len(p) for p in agent._codex_streamed_text_parts)
+                logger.warning(
+                    "Codex stream: SDK TypeError on response.completed "
+                    "(output=null from server). Recovering from "
+                    "%d collected output items / %d streamed chars. %s",
+                    len(collected_output_items),
+                    streamed_chars,
+                    agent._client_log_context(),
+                )
+                synth = SimpleNamespace(
+                    output=[],
+                    status="completed",
+                    model=api_kwargs.get("model", ""),
+                    usage=None,
+                )
+                if collected_output_items:
+                    synth.output = list(collected_output_items)
+                elif agent._codex_streamed_text_parts and not has_tool_calls:
+                    assembled = "".join(agent._codex_streamed_text_parts)
+                    synth.output = [SimpleNamespace(
+                        type="message",
+                        role="assistant",
+                        status="completed",
+                        content=[SimpleNamespace(type="output_text", text=assembled)],
+                    )]
+                if synth.output:
+                    return synth
+                # No usable data — fall through to raise
+                logger.warning(
+                    "Codex stream: TypeError recovery found no usable data; re-raising. %s",
+                    agent._client_log_context(),
+                )
+            raise
         except RuntimeError as exc:
             err_text = str(exc)
             missing_completed = "response.completed" in err_text
